@@ -89,24 +89,41 @@ async function getUnassignedShards(req, res, next) {
   }
 }
 
+function buildAlertSummary(analyzed) {
+  const alertLevelCounts = { critical: 0, warning: 0, info: 0 };
+  const rootCauseCounts = {};
+  const rootCauseAlerts = {};
+
+  analyzed.forEach((item) => {
+    if (alertLevelCounts[item.alert_level] !== undefined) {
+      alertLevelCounts[item.alert_level]++;
+    }
+    rootCauseCounts[item.root_cause] = (rootCauseCounts[item.root_cause] || 0) + 1;
+    if (!rootCauseAlerts[item.root_cause]) {
+      rootCauseAlerts[item.root_cause] = {
+        alert_level: item.alert_level,
+        alert_message: item.alert_message,
+        recommendation: item.recommendation,
+        count: 0,
+      };
+    }
+    rootCauseAlerts[item.root_cause].count++;
+  });
+
+  return { alertLevelCounts, rootCauseCounts, rootCauseAlerts };
+}
+
 async function analyzeUnassigned(req, res, next) {
   try {
     const analyzed = await shardService.analyzeUnassignedShards();
-    const severityCounts = {
-      critical: 0,
-      warning: 0,
-      info: 0,
-    };
-    analyzed.forEach((item) => {
-      if (severityCounts[item.severity] !== undefined) {
-        severityCounts[item.severity]++;
-      }
-    });
+    const { alertLevelCounts, rootCauseCounts, rootCauseAlerts } = buildAlertSummary(analyzed);
     res.json({
       success: true,
       summary: {
         total_unassigned: analyzed.length,
-        severity_counts: severityCounts,
+        alert_level_counts: alertLevelCounts,
+        root_cause_counts: rootCauseCounts,
+        root_cause_alerts: rootCauseAlerts,
       },
       data: analyzed,
     });
@@ -147,16 +164,7 @@ async function getFullReport(req, res, next) {
       shardService.getNodeAllocationStats(),
     ]);
 
-    const severityCounts = {
-      critical: 0,
-      warning: 0,
-      info: 0,
-    };
-    analyzed.forEach((item) => {
-      if (severityCounts[item.severity] !== undefined) {
-        severityCounts[item.severity]++;
-      }
-    });
+    const { alertLevelCounts, rootCauseCounts, rootCauseAlerts } = buildAlertSummary(analyzed);
 
     res.json({
       success: true,
@@ -168,7 +176,12 @@ async function getFullReport(req, res, next) {
         total_size: summary.total_size_formatted,
         total_docs: summary.total_docs,
         indices_with_unassigned: summary.indices_with_unassigned,
-        unassigned_severity_counts: severityCounts,
+      },
+      alert_summary: {
+        total_unassigned: analyzed.length,
+        alert_level_counts: alertLevelCounts,
+        root_cause_counts: rootCauseCounts,
+        root_cause_alerts: rootCauseAlerts,
       },
       unassigned_shards: {
         count: analyzed.length,
