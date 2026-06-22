@@ -195,6 +195,95 @@ async function getFullReport(req, res, next) {
   }
 }
 
+async function getIdleNodes(req, res, next) {
+  try {
+    const result = await shardService.getIdleNodes();
+    res.json({
+      success: true,
+      data: result,
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function getMigrationCandidates(req, res, next) {
+  try {
+    const { index } = req.query;
+    const result = await shardService.getMigrationCandidates(index || null);
+    res.json({
+      success: true,
+      data: result,
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function executeRelocation(req, res, next) {
+  try {
+    const { index, shard, from_node, to_node } = req.body;
+    const result = await shardService.executeRelocation(
+      index,
+      shard,
+      from_node,
+      to_node
+    );
+    res.json(result);
+  } catch (err) {
+    err.statusCode = 400;
+    next(err);
+  }
+}
+
+async function executeBatchRelocation(req, res, next) {
+  try {
+    const { operations } = req.body;
+    const result = await shardService.executeBatchRelocation(operations);
+    res.json(result);
+  } catch (err) {
+    err.statusCode = 400;
+    next(err);
+  }
+}
+
+async function setRelocationThrottle(req, res, next) {
+  try {
+    const { cluster_concurrent_rebalance, node_concurrent_recoveries } = req.body;
+    const result = await shardService.setRelocationThrottle(
+      cluster_concurrent_rebalance,
+      node_concurrent_recoveries
+    );
+    res.json(result);
+  } catch (err) {
+    err.statusCode = 400;
+    next(err);
+  }
+}
+
+async function getRelocationSettings(req, res, next) {
+  try {
+    const result = await shardService.getRelocationSettings();
+    res.json({
+      success: true,
+      data: result,
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function cancelRelocation(req, res, next) {
+  try {
+    const { index, shard, node } = req.body;
+    const result = await shardService.cancelRelocation(index, shard, node);
+    res.json(result);
+  } catch (err) {
+    err.statusCode = 400;
+    next(err);
+  }
+}
+
 module.exports = {
   getClusterHealth,
   getClusterStats,
@@ -206,4 +295,11 @@ module.exports = {
   getShardSummary,
   getNodeStats,
   getFullReport,
+  getIdleNodes,
+  getMigrationCandidates,
+  executeRelocation,
+  executeBatchRelocation,
+  setRelocationThrottle,
+  getRelocationSettings,
+  cancelRelocation,
 };

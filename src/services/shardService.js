@@ -428,6 +428,383 @@ async function getNodeAllocationStats() {
   };
 }
 
+async function getNodeInfoMap() {
+  const { body } = await client.nodes.info({
+    filter_path: ['nodes.*.name', 'nodes.*.host', 'nodes.*.ip'],
+  });
+  const nodeMap = {};
+  for (const [nodeId, info] of Object.entries(body.nodes || {})) {
+    nodeMap[nodeId] = {
+      nodeId,
+      name: info.name,
+      host: info.host,
+      ip: info.ip,
+    };
+  }
+  return nodeMap;
+}
+
+async function getRelocationSettings() {
+  try {
+    const { body } = await client.cluster.getSettings({
+      include_defaults: true,
+      filter_path: [
+        'defaults.cluster.routing.allocation.cluster_concurrent_rebalance',
+        'defaults.cluster.routing.allocation.node_concurrent_recoveries',
+        'defaults.cluster.routing.allocation.node_initial_primaries_recoveries',
+        'persistent.cluster.routing.allocation.cluster_concurrent_rebalance',
+        'persistent.cluster.routing.allocation.node_concurrent_recoveries',
+        'persistent.cluster.routing.allocation.node_initial_primaries_recoveries',
+        'transient.cluster.routing.allocation.cluster_concurrent_rebalance',
+        'transient.cluster.routing.allocation.node_concurrent_recoveries',
+        'transient.cluster.routing.allocation.node_initial_primaries_recoveries',
+      ],
+    });
+    return body;
+  } catch (err) {
+    return { error: err.message };
+  }
+}
+
+function analyzeNodeLoad(nodeStatsList) {
+  const validNodes = nodeStatsList.filter((n) =>
+    n.disk_percent !== null && n.disk_percent !== undefined && n.disk_percent !== 'N/A'
+  );
+
+  if (validNodes.length === 0) {
+    return { idle_nodes: [], busy_nodes: [], avg_shards: 0, avg_disk: 0 };
+  }
+
+  const totalShards = validNodes.reduce((sum, n) => sum + n.shards, 0);
+  const totalDisk = validNodes.reduce((sum, n) => {
+    const dp = parseFloat(n.disk_percent);
+    return sum + (isNaN(dp) ? 0 : dp);
+  }, 0);
+
+  const avgShards = totalShards / validNodes.length;
+  const avgDisk = totalDisk / validNodes.length;
+
+  const idleNodes = validNodes.filter((n) => {
+    const dp = parseFloat(n.disk_percent);
+    return n.shards < avgShards * 0.8 && dp < avgDisk * 0.8 && dp < 70;
+  }).sort((a, b) => a.shards - b.shards);
+
+  const busyNodes = validNodes.filter((n) => {
+    const dp = parseFloat(n.disk_percent);
+    return n.shards > avgShards * 1.2 || dp > avgDisk * 1.2 || dp > 85;
+  }).sort((a, b) => b.shards - a.shards);
+
+  return {
+    idle_nodes: idleNodes,
+    busy_nodes: busyNodes,
+    avg_shards: Math.round(avgShards * 100) / 100,
+    avg_disk_percent: Math.round(avgDisk * 100) / 100,
+  };
+}
+
+async function getIdleNodes() {
+  const nodeAllocationStats = await getNodeAllocationStats();
+  const [nodeInfoMap, shards] = await Promise.all([
+    getNodeInfoMap(),
+    getShardAllocationDetails(),
+  ]);
+
+  const loadAnalysis = analyzeNodeLoad(nodeAllocationStats.nodes);
+
+  const shardsByNode = {};
+  for (const s of shards) {
+    if (s.node && s.node !== 'UNASSIGNED') {
+      if (!shardsByNode[s.node]) shardsByNode[s.node] = [];
+      shardsByNode[s.node].push({
+        index: s.index,
+        shard: parseInt(s.shard, 10),
+        prirep: s.prirep,
+        state: s.state,
+        docs: s.docs ? parseInt(s.docs, 10) : 0,
+        store: s.store,
+      });
+    }
+  }
+
+  const idleNodesWithDetails = loadAnalysis.idle_nodes.map((node) => {
+    const dp = parseFloat(node.disk_percent);
+    const utilizationScore = (node.shards / (loadAnalysis.avg_shards || 1)) * 0.4
+      + (dp / 100) * 0.6;
+    return {
+      node_name: node.node,
+      ip: node.ip,
+      shards_count: node.shards,
+      disk_percent: dp,
+      disk_used: node.disk_used,
+      disk_avail: node.disk_avail,
+      disk_total: node.disk_total,
+      load_1m: node.load_1m,
+      load_5m: node.load_5m,
+      load_15m: node.load_15m,
+      cpu: node.cpu,
+      memory_percent: node.memory_percent,
+      utilization_score: Math.round(utilizationScore * 100) / 100,
+      shards: shardsByNode[node.node] || [],
+    };
+  });
+
+  const busyNodesWithDetails = loadAnalysis.busy_nodes.map((node) => {
+    const dp = parseFloat(node.disk_percent);
+    return {
+      node_name: node.node,
+      ip: node.ip,
+      shards_count: node.shards,
+      disk_percent: dp,
+      disk_used: node.disk_used,
+      disk_avail: node.disk_avail,
+      disk_total: node.disk_total,
+      shards: shardsByNode[node.node] || [],
+    };
+  });
+
+  const nodeIdToName = {};
+  for (const [nodeId, info] of Object.entries(nodeInfoMap)) {
+    nodeIdToName[nodeId] = info.name;
+    nodeIdToName[info.name] = nodeId;
+  }
+
+  return {
+    cluster_name: nodeAllocationStats.cluster_name,
+    baseline: {
+      total_nodes: nodeAllocationStats.total_nodes,
+      avg_shards_per_node: loadAnalysis.avg_shards,
+      avg_disk_percent: loadAnalysis.avg_disk_percent,
+    },
+    idle_nodes: idleNodesWithDetails,
+    busy_nodes: busyNodesWithDetails,
+    node_id_name_map: nodeIdToName,
+  };
+}
+
+async function getMigrationCandidates(index = null) {
+  const [idleResult, shards, shardSummary] = await Promise.all([
+    getIdleNodes(),
+    getShardAllocationDetails(index ? { index } : {}),
+    getShardAllocationSummary(),
+  ]);
+
+  const idleNodeNames = idleResult.idle_nodes.map((n) => n.node_name);
+  const busyNodeNames = idleResult.busy_nodes.map((n) => n.node_name);
+
+  const migratingShards = [];
+  for (const shard of shards) {
+    if (shard.state !== 'STARTED') continue;
+    if (!busyNodeNames.includes(shard.node)) continue;
+    if (shardSummary && shardSummary.indices) {
+      const idxInfo = shardSummary.indices.find((i) => i.name === shard.index);
+      if (idxInfo && idxInfo.health_status === 'red') continue;
+    }
+    migratingShards.push({
+      index: shard.index,
+      shard: parseInt(shard.shard, 10),
+      prirep: shard.prirep,
+      current_node: shard.node,
+      docs: shard.docs ? parseInt(shard.docs, 10) : 0,
+      store: shard.store,
+    });
+  }
+
+  const candidates = migratingShards.map((shard) => ({
+    ...shard,
+    candidate_target_nodes: idleNodeNames.filter((name) => {
+      const idxShards = shards.filter(
+        (s) => s.index === shard.index && s.shard === shard.shard.toString()
+      );
+      return !idxShards.some((s) => s.node === name);
+    }),
+  })).filter((c) => c.candidate_target_nodes.length > 0);
+
+  return {
+    cluster_name: idleResult.cluster_name,
+    baseline: idleResult.baseline,
+    busy_nodes: idleResult.busy_nodes.map((n) => ({
+      node_name: n.node_name,
+      shards_count: n.shards_count,
+      disk_percent: n.disk_percent,
+    })),
+    idle_nodes: idleResult.idle_nodes.map((n) => ({
+      node_name: n.node_name,
+      shards_count: n.shards_count,
+      disk_percent: n.disk_percent,
+      utilization_score: n.utilization_score,
+    })),
+    migration_candidates_count: candidates.length,
+    migration_candidates: candidates,
+  };
+}
+
+async function executeRelocation(index, shard, fromNode, toNode) {
+  if (!index || shard === undefined || shard === null || !fromNode || !toNode) {
+    throw new Error('缺少必要参数: index, shard, fromNode, toNode');
+  }
+
+  const shardNum = parseInt(shard, 10);
+  if (isNaN(shardNum)) {
+    throw new Error('shard 必须是数字');
+  }
+
+  if (fromNode === toNode) {
+    throw new Error('源节点和目标节点不能相同');
+  }
+
+  const shards = await getShardAllocationDetails({ index });
+  const targetShard = shards.find(
+    (s) => s.index === index && s.shard === shardNum.toString() && s.node === fromNode
+  );
+
+  if (!targetShard) {
+    throw new Error(`在节点 ${fromNode} 上未找到分片 ${index}[${shardNum}]`);
+  }
+
+  if (targetShard.state !== 'STARTED') {
+    throw new Error(`分片状态为 ${targetShard.state}，仅 STARTED 状态的分片可迁移`);
+  }
+
+  if (targetShard.prirep === 'p') {
+    const replicas = shards.filter(
+      (s) => s.index === index && s.shard === shardNum.toString() && s.prirep === 'r'
+    );
+    const hasSyncReplica = replicas.some((s) => s.state === 'STARTED');
+    if (!hasSyncReplica) {
+      throw new Error('主分片迁移前需确保至少有一个同步的副本分片，建议先提升副本再迁移');
+    }
+  }
+
+  const body = {
+    commands: [
+      {
+        move: {
+          index,
+          shard: shardNum,
+          from_node: fromNode,
+          to_node: toNode,
+        },
+      },
+    ],
+  };
+
+  const result = await client.cluster.reroute({
+    body,
+    retry_failed: true,
+    metric: ['nodes', 'allocation'],
+  });
+
+  return {
+    success: true,
+    acknowledged: result.body.acknowledged,
+    command: body.commands[0],
+    state: result.body.state,
+  };
+}
+
+async function executeBatchRelocation(operations) {
+  if (!Array.isArray(operations) || operations.length === 0) {
+    throw new Error('operations 必须是非空数组');
+  }
+
+  const commands = [];
+  for (const op of operations) {
+    if (!op.index || op.shard === undefined || !op.from_node || !op.to_node) {
+      throw new Error(`操作参数不完整: ${JSON.stringify(op)}`);
+    }
+    if (op.from_node === op.to_node) {
+      throw new Error(`源节点和目标节点不能相同: ${JSON.stringify(op)}`);
+    }
+    const shardNum = parseInt(op.shard, 10);
+    if (isNaN(shardNum)) {
+      throw new Error(`shard 必须是数字: ${op.shard}`);
+    }
+    commands.push({
+      move: {
+        index: op.index,
+        shard: shardNum,
+        from_node: op.from_node,
+        to_node: op.to_node,
+      },
+    });
+  }
+
+  const result = await client.cluster.reroute({
+    body: { commands },
+    retry_failed: true,
+  });
+
+  return {
+    success: true,
+    acknowledged: result.body.acknowledged,
+    commands_count: commands.length,
+    commands,
+    state: result.body.state,
+  };
+}
+
+async function setRelocationThrottle(concurrentRebalance, concurrentRecoveries) {
+  const body = { transient: {} };
+  if (concurrentRebalance !== undefined && concurrentRebalance !== null) {
+    const val = parseInt(concurrentRebalance, 10);
+    if (isNaN(val) || val < 0 || val > 20) {
+      throw new Error('cluster_concurrent_rebalance 必须是 0-20 之间的整数');
+    }
+    body.transient['cluster.routing.allocation.cluster_concurrent_rebalance'] = val.toString();
+  }
+  if (concurrentRecoveries !== undefined && concurrentRecoveries !== null) {
+    const val = parseInt(concurrentRecoveries, 10);
+    if (isNaN(val) || val < 0 || val > 20) {
+      throw new Error('node_concurrent_recoveries 必须是 0-20 之间的整数');
+    }
+    body.transient['cluster.routing.allocation.node_concurrent_recoveries'] = val.toString();
+  }
+
+  if (Object.keys(body.transient).length === 0) {
+    throw new Error('未提供任何限流参数');
+  }
+
+  const result = await client.cluster.putSettings({ body });
+
+  return {
+    success: true,
+    acknowledged: result.body.acknowledged,
+    applied_settings: body.transient,
+  };
+}
+
+async function cancelRelocation(index, shard, node) {
+  if (!index || shard === undefined || !node) {
+    throw new Error('缺少必要参数: index, shard, node');
+  }
+
+  const shardNum = parseInt(shard, 10);
+  if (isNaN(shardNum)) {
+    throw new Error('shard 必须是数字');
+  }
+
+  const body = {
+    commands: [
+      {
+        cancel: {
+          index,
+          shard: shardNum,
+          node,
+          allow_primary: true,
+        },
+      },
+    ],
+  };
+
+  const result = await client.cluster.reroute({ body });
+
+  return {
+    success: true,
+    acknowledged: result.body.acknowledged,
+    command: body.commands[0],
+  };
+}
+
 module.exports = {
   getClusterHealth,
   getClusterStats,
@@ -438,4 +815,11 @@ module.exports = {
   analyzeUnassignedShards,
   getShardAllocationSummary,
   getNodeAllocationStats,
+  getIdleNodes,
+  getMigrationCandidates,
+  executeRelocation,
+  executeBatchRelocation,
+  setRelocationThrottle,
+  cancelRelocation,
+  getRelocationSettings,
 };

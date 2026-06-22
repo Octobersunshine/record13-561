@@ -30,6 +30,13 @@ app.get('/', (req, res) => {
       analyze_unassigned: 'GET /api/cluster/shards/unassigned/analyze',
       allocation_explain: 'POST /api/cluster/shards/allocation-explain { index, shard, primary }',
       full_report: 'GET /api/cluster/report',
+      relocate_settings: 'GET /api/cluster/relocate/settings',
+      relocate_idle_nodes: 'GET /api/cluster/relocate/idle-nodes',
+      relocate_candidates: 'GET /api/cluster/relocate/candidates?index=',
+      relocate_execute: 'POST /api/cluster/relocate/execute { index, shard, from_node, to_node }',
+      relocate_batch: 'POST /api/cluster/relocate/batch { operations: [{index, shard, from_node, to_node}] }',
+      relocate_cancel: 'POST /api/cluster/relocate/cancel { index, shard, node }',
+      relocate_throttle: 'POST /api/cluster/relocate/throttle { cluster_concurrent_rebalance, node_concurrent_recoveries }',
     },
   });
 });
@@ -95,6 +102,13 @@ app.listen(config.server.port, () => {
   console.log('  GET  /api/cluster/shards/unassigned/analyze - Analyze unassigned');
   console.log('  POST /api/cluster/shards/allocation-explain - Explain allocation');
   console.log('  GET  /api/cluster/report               - Full report');
+  console.log('  GET  /api/cluster/relocate/settings    - Relocation settings');
+  console.log('  GET  /api/cluster/relocate/idle-nodes  - Idle nodes');
+  console.log('  GET  /api/cluster/relocate/candidates  - Migration candidates');
+  console.log('  POST /api/cluster/relocate/execute     - Execute relocation');
+  console.log('  POST /api/cluster/relocate/batch       - Batch relocation');
+  console.log('  POST /api/cluster/relocate/cancel      - Cancel relocation');
+  console.log('  POST /api/cluster/relocate/throttle    - Set throttle');
   console.log('');
 });
 

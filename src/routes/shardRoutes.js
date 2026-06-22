@@ -23,4 +23,18 @@ router.post('/shards/allocation-explain', shardController.getAllocationExplain);
 
 router.get('/report', shardController.getFullReport);
 
+router.get('/relocate/settings', shardController.getRelocationSettings);
+
+router.get('/relocate/idle-nodes', shardController.getIdleNodes);
+
+router.get('/relocate/candidates', shardController.getMigrationCandidates);
+
+router.post('/relocate/execute', shardController.executeRelocation);
+
+router.post('/relocate/batch', shardController.executeBatchRelocation);
+
+router.post('/relocate/cancel', shardController.cancelRelocation);
+
+router.post('/relocate/throttle', shardController.setRelocationThrottle);
+
 module.exports = router;
